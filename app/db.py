@@ -12,6 +12,7 @@ async def get_pool() -> asyncpg.Pool:
             min_size=2,
             max_size=10,
             command_timeout=30,
+            statement_cache_size=0,  # required for pgbouncer transaction-mode pooling
         )
     return _pool
 
