@@ -205,6 +205,45 @@ async def health(request: Request):
     return JSONResponse({"status": "ok", "version": VERSION})
 
 
+async def ping(request: Request):
+    """No-auth smoke test — confirms app is up and routes are working."""
+    return JSONResponse({
+        "status": "ok",
+        "version": VERSION,
+        "message": "GSC Analyst connector is running. Complete OAuth to get your connector URL.",
+        "routes": [
+            "GET  /health",
+            "GET  /ping           (this endpoint — no auth)",
+            "GET  /               (home page)",
+            "GET  /connect        (start OAuth)",
+            "GET  /oauth/callback (OAuth return)",
+            "GET  /sse?token=...  (MCP SSE — requires valid token from OAuth)",
+            "POST /messages/      (MCP messages — used by claude.ai internally)",
+        ],
+    })
+
+
+async def debug_routes(request: Request):
+    """Shows live registered routes for debugging. Remove after smoke test."""
+    from starlette.routing import Route as R, Mount as M
+    entries = []
+    for r in app.routes:
+        if isinstance(r, R):
+            entries.append({
+                "type": "Route",
+                "path": r.path,
+                "methods": sorted(r.methods) if r.methods else ["*"],
+                "name": r.name,
+            })
+        elif isinstance(r, M):
+            entries.append({
+                "type": "Mount",
+                "path": r.path,
+                "name": r.name,
+            })
+    return JSONResponse({"routes": entries})
+
+
 async def home(request: Request):
     return HTMLResponse(_home_page())
 
@@ -222,6 +261,8 @@ async def oauth_callback(request: Request):
 
 routes = [
     Route("/health", health),
+    Route("/ping", ping),
+    Route("/debug/routes", debug_routes),
     Route("/", home),
     Route("/connect", connect),
     Route("/oauth/callback", oauth_callback),
