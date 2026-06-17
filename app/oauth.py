@@ -139,7 +139,7 @@ async def handle_callback(request: Request):
         asyncio.create_task(_run_backfill(user_id, encrypted_rt, properties))
 
     base_url = os.environ["BASE_URL"]
-    mcp_url = f"{base_url}/u/{user_token}/sse"
+    mcp_url = f"{base_url}/sse?token={user_token}"
 
     return HTMLResponse(_success_page(mcp_url, email, len(properties)))
 
@@ -216,14 +216,14 @@ def _home_page() -> str:
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>GSC Analyst — AI-powered Search Console insights</title>
   <style>
-    body {{ font-family: system-ui, -apple-system, sans-serif; max-width: 580px;
-            margin: 80px auto; padding: 0 24px; color: #111; line-height: 1.6; }}
-    h1 {{ font-size: 2rem; margin-bottom: 12px; }}
-    p {{ font-size: 1.05rem; color: #333; }}
-    a.btn {{ display: inline-block; margin-top: 32px; padding: 14px 28px;
-             background: #1a56db; color: #fff; text-decoration: none;
-             border-radius: 6px; font-weight: 600; font-size: 1rem; }}
-    a.btn:hover {{ background: #1244b8; }}
+    body { font-family: system-ui, -apple-system, sans-serif; max-width: 580px;
+           margin: 80px auto; padding: 0 24px; color: #111; line-height: 1.6; }
+    h1 { font-size: 2rem; margin-bottom: 12px; }
+    p { font-size: 1.05rem; color: #333; }
+    a.btn { display: inline-block; margin-top: 32px; padding: 14px 28px;
+            background: #1a56db; color: #fff; text-decoration: none;
+            border-radius: 6px; font-weight: 600; font-size: 1rem; }
+    a.btn:hover { background: #1244b8; }
   </style>
 </head>
 <body>
