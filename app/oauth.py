@@ -1,58 +1,93 @@
-"""Google OAuth 2.0 web flow handlers."""
+"""Google OAuth 2.0 web flow — manual implementation, no PKCE.
+
+We use a standard authorization code flow for a confidential server-side client
+(client_secret is present). PKCE is for public clients; it is not required here
+and google_auth_oauthlib.flow.Flow auto-generates a code_verifier that we cannot
+round-trip across requests, causing invalid_grant errors. Solved by building the
+auth URL and token exchange ourselves with httpx + urllib.parse.
+"""
 import os
 import secrets
 import logging
 import asyncio
+from urllib.parse import urlencode
 
-from starlette.requests import Request
-from starlette.responses import RedirectResponse, HTMLResponse
-
-from google_auth_oauthlib.flow import Flow
+import httpx
 import google.oauth2.id_token
 import google.auth.transport.requests
 
+from starlette.requests import Request
+from starlette.responses import RedirectResponse, HTMLResponse, Response
+
 from app import db
 from app.crypto import encrypt_token
-from app.gsc_client import list_sites
 
 log = logging.getLogger(__name__)
 
-SCOPES = [
-    "https://www.googleapis.com/auth/webmasters.readonly",
+GOOGLE_AUTH_URI = "https://accounts.google.com/o/oauth2/v2/auth"
+GOOGLE_TOKEN_URI = "https://oauth2.googleapis.com/token"
+GOOGLE_USERINFO_URI = "https://www.googleapis.com/oauth2/v3/userinfo"
+
+# Exact scopes sent to Google — order matters for display, not for function
+SCOPES = " ".join([
     "openid",
     "https://www.googleapis.com/auth/userinfo.email",
-]
+    "https://www.googleapis.com/auth/webmasters.readonly",
+])
 
 
-def _make_flow() -> Flow:
-    return Flow.from_client_config(
-        {
-            "web": {
+def _auth_url(state: str) -> str:
+    params = {
+        "client_id": os.environ["GOOGLE_CLIENT_ID"],
+        "redirect_uri": os.environ["OAUTH_REDIRECT_URI"],
+        "response_type": "code",
+        "scope": SCOPES,
+        "access_type": "offline",
+        "prompt": "consent",         # force refresh_token on every connect
+        "state": state,
+        # No code_challenge — standard confidential-client flow
+    }
+    url = f"{GOOGLE_AUTH_URI}?{urlencode(params)}"
+    log.info("oauth_redirect_url scope=%r url=%s", SCOPES, url)
+    return url
+
+
+async def _exchange_code(code: str) -> dict:
+    """Exchange authorization code for tokens. Returns the token response dict."""
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(
+            GOOGLE_TOKEN_URI,
+            data={
+                "code": code,
                 "client_id": os.environ["GOOGLE_CLIENT_ID"],
                 "client_secret": os.environ["GOOGLE_CLIENT_SECRET"],
-                "auth_uri": "https://accounts.google.com/o/oauth2/auth",
-                "token_uri": "https://oauth2.googleapis.com/token",
-                "redirect_uris": [os.environ["OAUTH_REDIRECT_URI"]],
-            }
-        },
-        scopes=SCOPES,
-        redirect_uri=os.environ["OAUTH_REDIRECT_URI"],
-    )
+                "redirect_uri": os.environ["OAUTH_REDIRECT_URI"],
+                "grant_type": "authorization_code",
+                # No code_verifier — no PKCE
+            },
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            timeout=15,
+        )
+    resp.raise_for_status()
+    return resp.json()
+
+
+async def _get_email(access_token: str) -> str:
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(
+            GOOGLE_USERINFO_URI,
+            headers={"Authorization": f"Bearer {access_token}"},
+            timeout=10,
+        )
+    resp.raise_for_status()
+    return resp.json()["email"]
 
 
 async def handle_connect(request: Request):
-    flow = _make_flow()
     state = secrets.token_urlsafe(32)
-    auth_url, _ = flow.authorization_url(
-        access_type="offline",
-        prompt="consent",
-        include_granted_scopes="true",
-        state=state,
-    )
-    response = RedirectResponse(auth_url)
-    # Store state in signed cookie via itsdangerous (via Starlette sessions)
     request.session["oauth_state"] = state
-    return response
+    url = _auth_url(state)
+    return RedirectResponse(url)
 
 
 async def handle_callback(request: Request):
@@ -61,38 +96,40 @@ async def handle_callback(request: Request):
     if not stored_state or stored_state != received_state:
         return HTMLResponse("Invalid OAuth state. Please try again.", status_code=400)
 
-    code = request.query_params.get("code")
-    if not code:
-        error = request.query_params.get("error", "unknown")
+    error = request.query_params.get("error")
+    if error:
         return HTMLResponse(f"OAuth error: {error}", status_code=400)
 
+    code = request.query_params.get("code")
+    if not code:
+        return HTMLResponse("Missing authorization code.", status_code=400)
+
     try:
-        flow = _make_flow()
-        flow.fetch_token(code=code)
-        creds = flow.credentials
+        tokens = await _exchange_code(code)
+    except httpx.HTTPStatusError as e:
+        body = e.response.text
+        log.error("oauth_token_fetch_failed status=%d body=%s", e.response.status_code, body)
+        return HTMLResponse(
+            f"Failed to retrieve tokens from Google: {body}", status_code=500
+        )
     except Exception as e:
         log.error("oauth_token_fetch_failed error=%s", e)
         return HTMLResponse("Failed to retrieve tokens. Please try again.", status_code=500)
 
-    # Get user email from id_token or userinfo
-    try:
-        id_info = google.oauth2.id_token.verify_oauth2_token(
-            creds.id_token,
-            google.auth.transport.requests.Request(),
-            os.environ["GOOGLE_CLIENT_ID"],
-        )
-        email = id_info["email"]
-    except Exception as e:
-        log.error("oauth_id_token_verify_failed error=%s", e)
-        return HTMLResponse("Could not verify your Google account. Please try again.", status_code=500)
-
-    refresh_token = creds.refresh_token
+    refresh_token = tokens.get("refresh_token")
     if not refresh_token:
         return HTMLResponse(
             "Google did not return a refresh token. "
             "Please revoke access at myaccount.google.com/permissions and try again.",
             status_code=400,
         )
+
+    access_token = tokens.get("access_token", "")
+    try:
+        email = await _get_email(access_token)
+    except Exception as e:
+        log.error("oauth_userinfo_failed error=%s", e)
+        return HTMLResponse("Could not retrieve your email from Google.", status_code=500)
 
     # Upsert user
     user_token = secrets.token_urlsafe(32)
@@ -108,16 +145,14 @@ async def handle_callback(request: Request):
         user_id = str(existing["id"])
     else:
         row = await db.fetchrow(
-            """
-            INSERT INTO users (email, user_token, google_refresh_token)
-            VALUES ($1, $2, $3) RETURNING id
-            """,
+            "INSERT INTO users (email, user_token, google_refresh_token) "
+            "VALUES ($1, $2, $3) RETURNING id",
             email, user_token, encrypted_rt,
         )
         user_id = str(row["id"])
 
-    # Discover and store their Search Console properties
-    from app.gsc_client import build_service
+    # Discover Search Console properties
+    from app.gsc_client import build_service, list_sites
     try:
         service = build_service(encrypted_rt)
         properties = list_sites(service)
@@ -127,26 +162,21 @@ async def handle_callback(request: Request):
 
     for prop in properties:
         await db.execute(
-            """
-            INSERT INTO sites (user_id, property)
-            VALUES ($1, $2) ON CONFLICT (user_id, property) DO NOTHING
-            """,
+            "INSERT INTO sites (user_id, property) VALUES ($1, $2) "
+            "ON CONFLICT (user_id, property) DO NOTHING",
             user_id, prop,
         )
 
-    # Kick off backfill in background
     if properties:
-        asyncio.create_task(_run_backfill(user_id, encrypted_rt, properties))
+        asyncio.create_task(_run_backfill(user_id))
 
     base_url = os.environ["BASE_URL"]
     mcp_url = f"{base_url}/sse?token={user_token}"
-
     return HTMLResponse(_success_page(mcp_url, email, len(properties)))
 
 
-async def _run_backfill(user_id: str, encrypted_rt: str, properties: list[str]):
+async def _run_backfill(user_id: str):
     from app.collector import backfill
-
     user = await db.fetchrow("SELECT * FROM users WHERE id = $1", user_id)
     if not user:
         return
@@ -159,6 +189,7 @@ async def _run_backfill(user_id: str, encrypted_rt: str, properties: list[str]):
 
 
 def _success_page(mcp_url: str, email: str, site_count: int) -> str:
+    prop_word = "property" if site_count == 1 else "properties"
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -173,36 +204,35 @@ def _success_page(mcp_url: str, email: str, site_count: int) -> str:
              padding: 20px; margin: 24px 0; }}
     code {{ background: #eee; padding: 2px 6px; border-radius: 4px;
             font-size: 0.9em; word-break: break-all; }}
-    .steps ol {{ padding-left: 20px; }}
-    .steps li {{ margin-bottom: 10px; }}
+    ol {{ padding-left: 20px; }}
+    li {{ margin-bottom: 10px; }}
     .note {{ color: #666; font-size: 0.9rem; margin-top: 16px; }}
-    .tag {{ display: inline-block; background: #d4f4dd; color: #1a6b2f;
-            border-radius: 4px; padding: 2px 8px; font-size: 0.85rem; }}
   </style>
 </head>
 <body>
   <h1>&#10003; You're connected!</h1>
-  <p>Signed in as <strong>{email}</strong>. Found <strong>{site_count}</strong> Search Console {"property" if site_count == 1 else "properties"}.</p>
+  <p>Signed in as <strong>{email}</strong>.
+     Found <strong>{site_count}</strong> Search Console {prop_word}.</p>
 
   <div class="card">
-    <strong>Your personal connector URL:</strong><br>
+    <strong>Your personal connector URL:</strong><br><br>
     <code>{mcp_url}</code>
   </div>
 
-  <div class="steps">
-    <h2>How to connect in Claude</h2>
-    <ol>
-      <li>Open <strong>Claude.ai</strong> and go to <strong>Settings → Connectors</strong>.</li>
-      <li>Click <strong>Add custom connector</strong>.</li>
-      <li>Paste your URL above into the connector URL field.</li>
-      <li>Save — Claude will confirm the connection.</li>
-      <li>Start a new chat and ask something like: <em>"What's happening with my site traffic?"</em></li>
-    </ol>
-  </div>
+  <h2>How to connect in Claude</h2>
+  <ol>
+    <li>Open <strong>Claude.ai</strong> and go to
+        <strong>Settings &rarr; Connectors</strong>.</li>
+    <li>Click <strong>Add custom connector</strong>.</li>
+    <li>Paste the URL above into the connector URL field.</li>
+    <li>Save &mdash; Claude will confirm the connection.</li>
+    <li>Start a new chat and ask:
+        <em>&ldquo;What&rsquo;s happening with my site traffic?&rdquo;</em></li>
+  </ol>
 
   <p class="note">
-    &#9200; Data is being collected in the background and will be ready within <strong>~10 minutes</strong>.
-    Your first question might show limited data if you ask immediately.
+    &#9200; Data collection started in the background.
+    Results will be ready within <strong>~10 minutes</strong>.
   </p>
 </body>
 </html>"""
@@ -214,7 +244,7 @@ def _home_page() -> str:
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>GSC Analyst — AI-powered Search Console insights</title>
+  <title>GSC Analyst</title>
   <style>
     body { font-family: system-ui, -apple-system, sans-serif; max-width: 580px;
            margin: 80px auto; padding: 0 24px; color: #111; line-height: 1.6; }
@@ -229,8 +259,8 @@ def _home_page() -> str:
 <body>
   <h1>GSC Analyst</h1>
   <p>
-    Ask Claude plain-English questions about your Google Search Console data —
-    traffic trends, ranking drops, AI search visibility, and quick wins —
+    Ask Claude plain-English questions about your Google Search Console data &mdash;
+    traffic trends, ranking drops, AI search visibility, and quick wins &mdash;
     directly in your Claude chat.
   </p>
   <a class="btn" href="/connect">Connect your site &rarr;</a>
