@@ -219,8 +219,13 @@ async def _site_overview(site_id: str, prop: str, days: int) -> str:
 
     if not cur or not cur["clicks"]:
         return (
-            f"No data available for **{prop}** yet. "
-            "If you just connected, data should appear within ~10 minutes."
+            f"[TOOL RESULT — NO DATA]\n"
+            f"No Search Console data found in the database for property: {prop}\n"
+            f"Row count in daily_totals for this site_id and period: 0\n"
+            f"This is not an error — the site either has no GSC traffic yet, "
+            f"or data collection is still in progress (allow ~10 minutes after connecting).\n"
+            f"Do NOT supplement this result with example or estimated data. "
+            f"Return this message to the user exactly as-is."
         )
 
     cc, ci = int(cur["clicks"] or 0), int(cur["impressions"] or 0)
@@ -330,7 +335,12 @@ async def _analyze_changes(site_id: str, prop: str, days: int) -> str:
     )
 
     if not cur_pages:
-        return f"No page data available for **{prop}** in the selected period."
+        return (
+            f"[TOOL RESULT — NO DATA]\n"
+            f"No page-level data found in the database for property: {prop}\n"
+            f"Row count in daily_pages for this site_id and period: 0\n"
+            f"Do NOT supplement this result with example or estimated data."
+        )
 
     cur_map = {r["page"]: r for r in cur_pages}
     prev_map = {r["page"]: r for r in prev_pages}
@@ -457,13 +467,13 @@ async def _ai_visibility_snapshot(site_id: str, prop: str, days: int) -> str:
 
     if not cur_ai:
         return (
-            f"## AI Visibility — {prop}\n\n"
-            "AI appearance data not available for this property yet. "
-            "This may be because:\n"
-            "- Your site has very few AI Overview appearances\n"
-            "- Google hasn't made this data available via the API for your property\n"
-            "- Data is still being collected (check back in ~10 minutes if you just connected)\n\n"
-            "*(Note: AI Overview data in GSC API is limited and may not be available for all properties as of June 2026.)*"
+            f"[TOOL RESULT — NO DATA]\n"
+            f"No AI appearance data found in the database for property: {prop}\n"
+            f"Row count in daily_ai_appearance for this site_id and period: 0\n"
+            f"Possible reasons: site has no AI Overview appearances, "
+            f"Google has not exposed this data via API for this property, "
+            f"or data collection is still in progress.\n"
+            f"Do NOT supplement this result with example or estimated data."
         )
 
     prev_map = {r["appearance_type"]: r for r in prev_ai}
@@ -547,9 +557,11 @@ async def _low_hanging_fruit(site_id: str, prop: str, min_impressions: int) -> s
 
     if not rows:
         return (
-            f"## Low-Hanging Fruit — {prop}\n\n"
-            f"No queries found with position 8–15 and ≥{min_impressions} impressions "
-            "in the last 28 days. Try lowering `min_impressions`."
+            f"[TOOL RESULT — NO DATA]\n"
+            f"No queries found in database for property: {prop}\n"
+            f"Filter: position 8–15, impressions >= {min_impressions}, last 28 days\n"
+            f"Row count: 0\n"
+            f"Do NOT supplement this result with example or estimated data."
         )
 
     # Estimate upside: rough CTR model top-5 avg = 15%, top-1 = 28%
