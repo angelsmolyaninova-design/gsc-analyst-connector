@@ -2,14 +2,8 @@
 Main Starlette application.
 
 MCP transport: low-level mcp.server.Server + SseServerTransport.
-  - GET /sse?token={user_token}   → SSE connection (claude.ai connects here)
-  - POST /messages/               → client → server messages (handled by transport)
-
-The SseServerTransport sends an "endpoint" event that directs the client to POST
-to /messages/?session_id=<uuid>. We mount /messages/ with Starlette Mount so the
-ASGI app receives the request directly without Starlette's request wrapping.
-
-Connector URL shown to users: https://domain/sse?token={user_token}
+  GET  /sse?token={user_token}  — SSE connection (claude.ai connects here)
+  POST /messages/               — client messages (handled by transport)
 """
 import logging
 import os
@@ -24,7 +18,7 @@ from starlette.routing import Route, Mount
 
 from mcp.server.sse import SseServerTransport
 
-from app.mcp_server import VERSION, _dispatch
+from app.mcp_server import VERSION, dispatch_tool
 from app.oauth import handle_connect, handle_callback, _home_page
 from app import db
 from app.scheduler import start_scheduler, stop_scheduler
@@ -35,7 +29,6 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# Single shared transport — session_id ties each POST back to the right SSE connection
 sse_transport = SseServerTransport("/messages/")
 
 
@@ -50,7 +43,28 @@ async def lifespan(app):
     log.info("app_stopped")
 
 
-# ─── MCP server factory (per-connection, with user_id baked in) ──────────────
+# ─── MCP server factory ─────────────────────────────────────────────────────
+
+DETAIL_PARAM = {
+    "type": "string",
+    "enum": ["summary", "full"],
+    "description": "Level of detail. summary (default): top 5 items. full: up to 10 items.",
+}
+
+SITE_PARAM = {
+    "type": "string",
+    "description": (
+        "GSC property URI (e.g. 'sc-domain:example.com'). "
+        "Omit to use the default property."
+    ),
+}
+
+PERIOD_PARAM = {
+    "type": "string",
+    "enum": ["7d", "14d", "28d", "90d"],
+    "description": "Look-back period. Default: 28d.",
+}
+
 
 def _build_user_server(user_id: str):
     from mcp.server import Server
@@ -64,107 +78,118 @@ def _build_user_server(user_id: str):
             Tool(
                 name="ping",
                 description=(
-                    "Health check. Returns server version. "
-                    "Call to verify the connector is working."
+                    "Health check. Returns server version and confirms "
+                    "the connector is reachable. No data is returned."
                 ),
                 inputSchema={"type": "object", "properties": {}},
+                annotations={
+                    "title": "Ping",
+                    "readOnlyHint": True,
+                    "destructiveHint": False,
+                },
             ),
             Tool(
                 name="site_overview",
                 description=(
-                    "Returns traffic summary for a site over a recent period compared to "
-                    "the previous equal period. Includes totals (clicks, impressions, CTR, "
-                    "position), top 5 pages and queries with delta, and auto-flagged declines. "
-                    "Call this first for a general 'what is happening with my site' question."
+                    "Returns a traffic summary from daily-batch Google Search Console data "
+                    "(not real-time) for a site over a recent period, compared to the prior "
+                    "equal period. Includes totals (clicks, impressions, CTR, position), "
+                    "top pages and queries with change deltas, and auto-flagged declines. "
+                    "Use as the first call for general traffic questions. "
+                    "Returns an explicit empty-state message when no data exists."
                 ),
                 inputSchema={
                     "type": "object",
                     "properties": {
-                        "site": {
-                            "type": "string",
-                            "description": (
-                                "GSC property URI (e.g. 'sc-domain:example.com'). "
-                                "Omit to use the user's first property."
-                            ),
-                        },
-                        "period": {
-                            "type": "string",
-                            "enum": ["7d", "14d", "28d", "90d"],
-                            "description": "Look-back period. Default: 28d.",
-                        },
+                        "site": SITE_PARAM,
+                        "period": PERIOD_PARAM,
+                        "detail": DETAIL_PARAM,
                     },
+                },
+                annotations={
+                    "title": "Site Overview",
+                    "readOnlyHint": True,
+                    "destructiveHint": False,
                 },
             ),
             Tool(
                 name="analyze_changes",
                 description=(
-                    "Decomposes traffic change into page-level drivers. Returns pages with "
-                    "largest click delta, diagnosis of cause (position drop, CTR drop, "
-                    "impression loss), flags for sudden day-over-day shifts, and estimated "
-                    "AI Overview impact where applicable. "
-                    "Use for 'why did traffic change' or 'what dropped'."
+                    "Decomposes a traffic change into page-level drivers using daily-batch "
+                    "GSC data (not real-time). Returns pages with the largest click delta, "
+                    "a diagnosis of likely cause (position drop, CTR drop, impression loss), "
+                    "and flags for sudden day-over-day shifts. May note estimated possible "
+                    "AI Overview impact where patterns suggest it, but this is a hypothesis "
+                    "based on correlations, NOT a confirmed attribution. "
+                    "Use when the user asks why traffic changed or what dropped."
                 ),
                 inputSchema={
                     "type": "object",
                     "properties": {
-                        "site": {"type": "string"},
-                        "period": {
-                            "type": "string",
-                            "enum": ["7d", "14d", "28d", "90d"],
-                            "description": "Default: 28d.",
-                        },
+                        "site": SITE_PARAM,
+                        "period": PERIOD_PARAM,
+                        "detail": DETAIL_PARAM,
                     },
+                },
+                annotations={
+                    "title": "Analyze Changes",
+                    "readOnlyHint": True,
+                    "destructiveHint": False,
                 },
             ),
             Tool(
                 name="ai_visibility_snapshot",
                 description=(
-                    "Shows how the site appears in Google AI features (AI Overviews, etc.). "
-                    "Returns impressions and clicks by AI appearance type vs prior period. "
-                    "Returns honest 'not available' if data is missing. "
-                    "Use for questions about AI search visibility."
+                    "Shows how the site appears in Google AI search features based on the "
+                    "searchAppearance dimension in daily-batch GSC data. Returns impressions "
+                    "and clicks by appearance type vs prior period. AI-specific appearance "
+                    "types may be limited depending on what Google exposes via the API. "
+                    "Returns an honest empty-state when no data is available — never "
+                    "fabricates numbers. Use for AI search visibility questions."
                 ),
                 inputSchema={
                     "type": "object",
                     "properties": {
-                        "site": {"type": "string"},
-                        "period": {
-                            "type": "string",
-                            "enum": ["7d", "14d", "28d", "90d"],
-                            "description": "Default: 28d.",
-                        },
+                        "site": SITE_PARAM,
+                        "period": PERIOD_PARAM,
                     },
+                },
+                annotations={
+                    "title": "AI Visibility",
+                    "readOnlyHint": True,
+                    "destructiveHint": False,
                 },
             ),
             Tool(
                 name="low_hanging_fruit",
                 description=(
-                    "Finds queries ranked in positions 8-15 with enough impressions to "
-                    "be worth optimizing. Returns up to 10 rows with estimated extra clicks "
-                    "if page reaches top-5, plus brief optimization hints. "
-                    "Use for 'what should I fix first' or 'quick wins' questions."
+                    "Finds queries ranked in positions 8-15 with enough impressions to be "
+                    "worth optimizing, using 28 days of daily-batch GSC data. Returns up to "
+                    "10 rows with estimated extra clicks if the page reaches top-5 (rough "
+                    "model assuming ~15%% avg top-5 CTR — actual results will vary). Includes "
+                    "brief optimization hints. Use for quick-win or priority-fix questions."
                 ),
                 inputSchema={
                     "type": "object",
                     "properties": {
-                        "site": {"type": "string"},
+                        "site": SITE_PARAM,
                         "min_impressions": {
                             "type": "integer",
                             "description": "Minimum impressions over 28 days. Default: 200.",
                         },
                     },
                 },
+                annotations={
+                    "title": "Low-Hanging Fruit",
+                    "readOnlyHint": True,
+                    "destructiveHint": False,
+                },
             ),
         ]
 
     @server.call_tool()
     async def call_tool(name: str, arguments: dict) -> list[TextContent]:
-        try:
-            result = await _dispatch(name, arguments, user_id=user_id)
-        except Exception as e:
-            log.error("tool_error tool=%s user_id=%s error=%s", name, user_id, e)
-            return [TextContent(type="text", text=f"Error: {e}")]
-        return [TextContent(type="text", text=result)]
+        return await dispatch_tool(name, arguments, user_id=user_id)
 
     return server
 
@@ -172,7 +197,6 @@ def _build_user_server(user_id: str):
 # ─── MCP endpoints ───────────────────────────────────────────────────────────
 
 async def sse_endpoint(request: Request):
-    """GET /sse?token={user_token} — establish SSE connection for claude.ai."""
     token = request.query_params.get("token")
     if not token:
         return Response("Missing token query parameter.", status_code=400)
@@ -185,17 +209,13 @@ async def sse_endpoint(request: Request):
     log.info("mcp_sse_connect user_id=%s", user_id)
 
     mcp_server = _build_user_server(user_id)
-
     async with sse_transport.connect_sse(
         request.scope, request.receive, request._send
     ) as streams:
         await mcp_server.run(
-            streams[0],
-            streams[1],
+            streams[0], streams[1],
             mcp_server.create_initialization_options(),
         )
-
-    # Must return a Response to avoid TypeError on client disconnect
     return Response()
 
 
@@ -206,42 +226,16 @@ async def health(request: Request):
 
 
 async def ping(request: Request):
-    """No-auth smoke test — confirms app is up and routes are working."""
     return JSONResponse({
         "status": "ok",
         "version": VERSION,
-        "message": "GSC Analyst connector is running. Complete OAuth to get your connector URL.",
+        "message": "GSC Analyst connector is running.",
         "routes": [
-            "GET  /health",
-            "GET  /ping           (this endpoint — no auth)",
-            "GET  /               (home page)",
-            "GET  /connect        (start OAuth)",
-            "GET  /oauth/callback (OAuth return)",
-            "GET  /sse?token=...  (MCP SSE — requires valid token from OAuth)",
-            "POST /messages/      (MCP messages — used by claude.ai internally)",
+            "GET  /health", "GET  /ping", "GET  /",
+            "GET  /connect", "GET  /oauth/callback",
+            "GET  /sse?token=...", "POST /messages/",
         ],
     })
-
-
-async def debug_routes(request: Request):
-    """Shows live registered routes for debugging. Remove after smoke test."""
-    from starlette.routing import Route as R, Mount as M
-    entries = []
-    for r in app.routes:
-        if isinstance(r, R):
-            entries.append({
-                "type": "Route",
-                "path": r.path,
-                "methods": sorted(r.methods) if r.methods else ["*"],
-                "name": r.name,
-            })
-        elif isinstance(r, M):
-            entries.append({
-                "type": "Mount",
-                "path": r.path,
-                "name": r.name,
-            })
-    return JSONResponse({"routes": entries})
 
 
 async def home(request: Request):
@@ -257,12 +251,10 @@ async def oauth_callback(request: Request):
 
 
 # ─── App assembly ─────────────────────────────────────────────────────────────
-# Mount /messages/ as a raw ASGI app (not a Route endpoint) — required by SDK.
 
 routes = [
     Route("/health", health),
     Route("/ping", ping),
-    Route("/debug/routes", debug_routes),
     Route("/", home),
     Route("/connect", connect),
     Route("/oauth/callback", oauth_callback),
@@ -278,16 +270,11 @@ middleware = [
     )
 ]
 
-app = Starlette(
-    routes=routes,
-    middleware=middleware,
-    lifespan=lifespan,
-)
+app = Starlette(routes=routes, middleware=middleware, lifespan=lifespan)
 
 
 if __name__ == "__main__":
     import uvicorn
-
     uvicorn.run(
         "app.main:app",
         host="0.0.0.0",

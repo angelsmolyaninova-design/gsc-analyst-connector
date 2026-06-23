@@ -167,11 +167,13 @@ async def handle_callback(request: Request):
             user_id, prop,
         )
 
-    if properties:
-        asyncio.create_task(_run_backfill(user_id))
-
     base_url = os.environ["BASE_URL"]
     mcp_url = f"{base_url}/sse?token={user_token}"
+
+    if not properties:
+        return HTMLResponse(_zero_properties_page(email))
+
+    asyncio.create_task(_run_backfill(user_id))
     return HTMLResponse(_success_page(mcp_url, email, len(properties)))
 
 
@@ -234,6 +236,47 @@ def _success_page(mcp_url: str, email: str, site_count: int) -> str:
     &#9200; Data collection started in the background.
     Results will be ready within <strong>~10 minutes</strong>.
   </p>
+</body>
+</html>"""
+
+
+def _zero_properties_page(email: str) -> str:
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>No Properties Found — GSC Analyst</title>
+  <style>
+    body {{ font-family: system-ui, -apple-system, sans-serif; max-width: 680px;
+            margin: 60px auto; padding: 0 24px; color: #111; line-height: 1.6; }}
+    h1 {{ font-size: 1.5rem; margin-bottom: 8px; color: #b45309; }}
+    .card {{ background: #fffbeb; border: 1px solid #f59e0b; border-radius: 8px;
+             padding: 20px; margin: 24px 0; }}
+    ol {{ padding-left: 20px; }}
+    li {{ margin-bottom: 10px; }}
+    a {{ color: #1a56db; }}
+    a.btn {{ display: inline-block; margin-top: 24px; padding: 12px 24px;
+             background: #1a56db; color: #fff; text-decoration: none;
+             border-radius: 6px; font-weight: 600; }}
+  </style>
+</head>
+<body>
+  <h1>No Search Console Properties Found</h1>
+  <p>Signed in as <strong>{email}</strong>, but your Google account has no
+     Search Console properties linked to it.</p>
+
+  <div class="card">
+    <strong>What to do:</strong>
+    <ol>
+      <li>Go to <a href="https://search.google.com/search-console" target="_blank">
+          Google Search Console</a> and add your website as a property.</li>
+      <li>Complete the verification process (DNS, HTML file, or other method).</li>
+      <li>Come back here and click the button below to reconnect.</li>
+    </ol>
+  </div>
+
+  <a class="btn" href="/connect">Reconnect after adding a property &rarr;</a>
 </body>
 </html>"""
 

@@ -1,146 +1,91 @@
 """MCP tool definitions for GSC Analyst."""
 import logging
+import time
 from datetime import date, timedelta
-from typing import Any
 
-from mcp.server import Server
-from mcp.types import Tool, TextContent
+from mcp.types import TextContent
 
 from app import db
 
 log = logging.getLogger(__name__)
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 
 
-def make_mcp_server() -> Server:
-    server = Server("gsc-analyst")
-
-    @server.list_tools()
-    async def list_tools() -> list[Tool]:
-        return [
-            Tool(
-                name="ping",
-                description=(
-                    "Health check. Returns server version. "
-                    "Call this to verify the connector is working."
-                ),
-                inputSchema={"type": "object", "properties": {}},
-            ),
-            Tool(
-                name="site_overview",
-                description=(
-                    "Returns traffic summary for a site over a recent period, "
-                    "compared to the previous equal period. "
-                    "Includes totals (clicks, impressions, CTR, position), "
-                    "top 5 pages and queries with delta, and auto-flagged declines. "
-                    "Call this first for a general 'what's happening' question."
-                ),
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "site": {
-                            "type": "string",
-                            "description": "GSC property (e.g. 'sc-domain:example.com'). Defaults to user's first property.",
-                        },
-                        "period": {
-                            "type": "string",
-                            "enum": ["7d", "14d", "28d", "90d"],
-                            "description": "Period length. Default: 28d.",
-                        },
-                    },
-                },
-            ),
-            Tool(
-                name="analyze_changes",
-                description=(
-                    "Decomposes traffic change into page-level drivers. "
-                    "Returns pages with largest click delta, breakdown of whether "
-                    "the cause is position drop, CTR drop, or impression loss, "
-                    "plus flags for sudden day-over-day shifts and possible "
-                    "AI Overview impact (estimated, not confirmed). "
-                    "Use when the user asks 'why did traffic change' or 'what dropped'."
-                ),
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "site": {"type": "string"},
-                        "period": {
-                            "type": "string",
-                            "enum": ["7d", "14d", "28d", "90d"],
-                            "description": "Default: 28d.",
-                        },
-                    },
-                },
-            ),
-            Tool(
-                name="ai_visibility_snapshot",
-                description=(
-                    "Shows how the site appears in Google AI features (AI Overviews, etc.). "
-                    "Returns impressions/clicks by AI appearance type vs prior period, "
-                    "top pages in AI features, and pages where AI impressions grew "
-                    "but CTR fell. Returns honest 'not available' if data is missing. "
-                    "Use for questions about AI search visibility or AI Overviews."
-                ),
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "site": {"type": "string"},
-                        "period": {
-                            "type": "string",
-                            "enum": ["7d", "14d", "28d", "90d"],
-                            "description": "Default: 28d.",
-                        },
-                    },
-                },
-            ),
-            Tool(
-                name="low_hanging_fruit",
-                description=(
-                    "Finds queries ranked in positions 8–15 with enough impressions "
-                    "to be worth optimizing. Returns up to 10 rows with estimated "
-                    "upside if the page reaches top-5, grouped by page, with "
-                    "brief optimization hints (title/intro/FAQ vs deeper content). "
-                    "Use for 'what should I fix first' or 'quick wins' questions."
-                ),
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "site": {"type": "string"},
-                        "min_impressions": {
-                            "type": "integer",
-                            "description": "Minimum impressions over 28 days. Default: 200.",
-                        },
-                    },
-                },
-            ),
-        ]
-
-    @server.call_tool()
-    async def call_tool(name: str, arguments: dict, *, user_id: str | None = None) -> list[TextContent]:
-        try:
-            result = await _dispatch(name, arguments, user_id=user_id)
-        except Exception as e:
-            log.error("tool_error tool=%s user_id=%s error=%s", name, user_id, e)
-            return [TextContent(type="text", text=f"Error: {e}")]
-        return [TextContent(type="text", text=result)]
-
-    return server
+async def _log_tool_call(
+    user_id: str | None, tool_name: str, site_id: str | None,
+    duration_ms: int, success: bool,
+):
+    try:
+        await db.execute(
+            "INSERT INTO tool_calls (user_id, tool_name, site_id, duration_ms, success) "
+            "VALUES ($1, $2, $3, $4, $5)",
+            user_id, tool_name, site_id, duration_ms, success,
+        )
+    except Exception as e:
+        log.warning("tool_call_log_failed tool=%s error=%s", tool_name, e)
 
 
-async def _dispatch(name: str, args: dict, *, user_id: str | None) -> str:
+def _friendly_error(e: Exception) -> str:
+    msg = str(e).lower()
+    if "quota" in msg or "rate" in msg or "rateLimitExceeded" in str(e):
+        return (
+            "Google API quota exceeded. Data will refresh automatically "
+            "within an hour. Please try again later."
+        )
+    if "invalid_grant" in msg or "revoked" in msg or "expired" in msg:
+        return (
+            "Your Google authorization has expired or been revoked. "
+            "Please reconnect at the connector homepage to re-authorize."
+        )
+    if "connection" in msg or "timeout" in msg or "could not connect" in msg:
+        return (
+            "Database connection issue. This is usually temporary — "
+            "please try again in a minute."
+        )
+    if "permission" in msg or "forbidden" in msg or "403" in msg:
+        return (
+            "Access denied by Google. Your account may not have permission "
+            "to view this Search Console property."
+        )
+    return f"Something went wrong: {type(e).__name__}. Please try again shortly."
+
+
+async def dispatch_tool(
+    name: str, args: dict, *, user_id: str | None
+) -> list[TextContent]:
+    t0 = time.monotonic()
+    site_id = None
+    try:
+        result, site_id = await _dispatch(name, args, user_id=user_id)
+    except Exception as e:
+        dur = int((time.monotonic() - t0) * 1000)
+        log.error("tool_error tool=%s user_id=%s error=%s", name, user_id, e)
+        await _log_tool_call(user_id, name, None, dur, False)
+        return [TextContent(type="text", text=_friendly_error(e))]
+
+    dur = int((time.monotonic() - t0) * 1000)
+    log.info("tool_call tool=%s user_id=%s duration_ms=%d", name, user_id, dur)
+    await _log_tool_call(user_id, name, site_id, dur, True)
+    return [TextContent(type="text", text=result)]
+
+
+async def _dispatch(
+    name: str, args: dict, *, user_id: str | None
+) -> tuple[str, str | None]:
+    """Returns (result_text, site_id_or_none)."""
     if name == "ping":
-        return f"GSC Analyst connector v{VERSION} — OK"
+        return f"GSC Analyst connector v{VERSION} — OK", None
 
     if not user_id:
-        return "Error: Could not identify user from connector URL."
+        return "Error: Could not identify user from connector URL.", None
 
     sites = await db.get_sites_for_user(user_id)
     if not sites:
         return (
             "No Search Console properties found for your account. "
             "Please reconnect at the connector homepage."
-        )
+        ), None
 
     site_param = args.get("site")
     if site_param:
@@ -149,34 +94,36 @@ async def _dispatch(name: str, args: dict, *, user_id: str | None) -> str:
         )
         if not site_record:
             props = ", ".join(s["property"] for s in sites)
-            return f"Site '{site_param}' not found. Your properties: {props}"
+            return f"Site '{site_param}' not found. Your properties: {props}", None
     else:
         site_record = sites[0]
 
-    # Security: ensure site belongs to this user (already guaranteed by query above)
     site_id = str(site_record["id"])
     property_name = site_record["property"]
 
     period = args.get("period", "28d")
     days = int(period.rstrip("d"))
+    detail = args.get("detail", "summary")
 
     if name == "site_overview":
-        return await _site_overview(site_id, property_name, days)
+        r = await _site_overview(site_id, property_name, days, detail)
     elif name == "analyze_changes":
-        return await _analyze_changes(site_id, property_name, days)
+        r = await _analyze_changes(site_id, property_name, days, detail)
     elif name == "ai_visibility_snapshot":
-        return await _ai_visibility_snapshot(site_id, property_name, days)
+        r = await _ai_visibility_snapshot(site_id, property_name, days)
     elif name == "low_hanging_fruit":
         min_imp = args.get("min_impressions", 200)
-        return await _low_hanging_fruit(site_id, property_name, min_imp)
+        r = await _low_hanging_fruit(site_id, property_name, min_imp)
     else:
-        return f"Unknown tool: {name}"
+        r = f"Unknown tool: {name}"
+
+    return r, site_id
 
 
-# ─── Tool implementations ───────────────────────────────────────────────────
+# ─── Helpers ─────────────────────────────────────────────────────────────────
 
 def _period_dates(days: int) -> tuple[date, date, date, date]:
-    end = date.today() - timedelta(days=2)  # GSC lag
+    end = date.today() - timedelta(days=2)
     start = end - timedelta(days=days - 1)
     prev_end = start - timedelta(days=1)
     prev_start = prev_end - timedelta(days=days - 1)
@@ -197,48 +144,50 @@ def _delta_str(new: float, old: float) -> str:
     return f"{sign}{d:.0f}"
 
 
-async def _site_overview(site_id: str, prop: str, days: int) -> str:
+_NO_DATA = (
+    "[TOOL RESULT — NO DATA]\n"
+    "Row count: 0 for the queried site and period.\n"
+    "Do NOT supplement this result with example or estimated data."
+)
+
+
+# ─── site_overview ───────────────────────────────────────────────────────────
+
+async def _site_overview(site_id: str, prop: str, days: int, detail: str) -> str:
     start, end, prev_start, prev_end = _period_dates(days)
 
     cur = await db.fetchrow(
-        """
-        SELECT SUM(clicks) clicks, SUM(impressions) impressions,
-               AVG(ctr) ctr, AVG(position) position
-        FROM daily_totals WHERE site_id=$1 AND date BETWEEN $2 AND $3
-        """,
+        "SELECT SUM(clicks) clicks, SUM(impressions) impressions, "
+        "AVG(ctr) ctr, AVG(position) position "
+        "FROM daily_totals WHERE site_id=$1 AND date BETWEEN $2 AND $3",
         site_id, start, end,
     )
     prev = await db.fetchrow(
-        """
-        SELECT SUM(clicks) clicks, SUM(impressions) impressions,
-               AVG(ctr) ctr, AVG(position) position
-        FROM daily_totals WHERE site_id=$1 AND date BETWEEN $2 AND $3
-        """,
+        "SELECT SUM(clicks) clicks, SUM(impressions) impressions, "
+        "AVG(ctr) ctr, AVG(position) position "
+        "FROM daily_totals WHERE site_id=$1 AND date BETWEEN $2 AND $3",
         site_id, prev_start, prev_end,
     )
 
     if not cur or not cur["clicks"]:
         return (
-            f"[TOOL RESULT — NO DATA]\n"
-            f"No Search Console data found in the database for property: {prop}\n"
-            f"Row count in daily_totals for this site_id and period: 0\n"
-            f"This is not an error — the site either has no GSC traffic yet, "
-            f"or data collection is still in progress (allow ~10 minutes after connecting).\n"
-            f"Do NOT supplement this result with example or estimated data. "
-            f"Return this message to the user exactly as-is."
+            f"No Search Console data found for property: {prop}\n"
+            f"Period queried: {start} to {end}\n" + _NO_DATA
         )
 
     cc, ci = int(cur["clicks"] or 0), int(cur["impressions"] or 0)
-    pc, pi = int(prev["clicks"] or 0) if prev else 0, int(prev["impressions"] or 0) if prev else 0
+    pc = int(prev["clicks"] or 0) if prev else 0
+    pi = int(prev["impressions"] or 0) if prev else 0
     cctr = float(cur["ctr"] or 0) * 100
     cpos = float(cur["position"] or 0)
 
     lines = [
         f"## Site Overview — {prop}",
-        f"**Period:** {start} → {end} ({days}d) vs {prev_start} → {prev_end}\n",
+        f"**Period:** {start} to {end} ({days}d) vs {prev_start} to {prev_end}",
+        f"*Data collected daily from Google Search Console (not real-time).*\n",
         "### Totals",
-        f"| Metric | Current | vs Prior |",
-        f"|--------|---------|----------|",
+        "| Metric | Current | vs Prior |",
+        "|--------|---------|----------|",
         f"| Clicks | {cc:,} | {_pct(cc, pc)} |",
         f"| Impressions | {ci:,} | {_pct(ci, pi)} |",
         f"| Avg CTR | {cctr:.2f}% | — |",
@@ -246,27 +195,25 @@ async def _site_overview(site_id: str, prop: str, days: int) -> str:
         "",
     ]
 
-    # Top 5 pages
+    top_n = 5 if detail == "summary" else 10
+
+    # Top pages
     top_pages_cur = await db.fetch(
-        """
-        SELECT page, SUM(clicks) clicks FROM daily_pages
-        WHERE site_id=$1 AND date BETWEEN $2 AND $3
-        GROUP BY page ORDER BY clicks DESC LIMIT 5
-        """,
-        site_id, start, end,
+        "SELECT page, SUM(clicks) clicks FROM daily_pages "
+        "WHERE site_id=$1 AND date BETWEEN $2 AND $3 "
+        "GROUP BY page ORDER BY clicks DESC LIMIT $4",
+        site_id, start, end, top_n,
     )
     top_pages_prev = await db.fetch(
-        """
-        SELECT page, SUM(clicks) clicks FROM daily_pages
-        WHERE site_id=$1 AND date BETWEEN $2 AND $3
-        GROUP BY page ORDER BY clicks DESC LIMIT 20
-        """,
+        "SELECT page, SUM(clicks) clicks FROM daily_pages "
+        "WHERE site_id=$1 AND date BETWEEN $2 AND $3 "
+        "GROUP BY page ORDER BY clicks DESC LIMIT 20",
         site_id, prev_start, prev_end,
     )
     prev_page_map = {r["page"]: int(r["clicks"] or 0) for r in top_pages_prev}
 
     if top_pages_cur:
-        lines += ["### Top 5 Pages", "| Page | Clicks | Δ |", "|------|--------|---|"]
+        lines += [f"### Top {len(top_pages_cur)} Pages", "| Page | Clicks | Δ |", "|------|--------|---|"]
         flags = []
         for r in top_pages_cur:
             cl = int(r["clicks"] or 0)
@@ -275,32 +222,28 @@ async def _site_overview(site_id: str, prop: str, days: int) -> str:
             short = r["page"].replace("https://", "").replace("http://", "")[:60]
             lines.append(f"| {short} | {cl:,} | {delta} |")
             if prev_cl > 0 and cl < prev_cl * 0.8:
-                flags.append(f"⚠ **{short}** lost >{100 - int(cl/prev_cl*100)}% clicks")
+                flags.append(f"- **{short}** lost >{100 - int(cl / prev_cl * 100)}% clicks")
         if flags:
             lines += ["", "**Flags:**"] + flags
         lines.append("")
 
-    # Top 5 queries
+    # Top queries
     top_q_cur = await db.fetch(
-        """
-        SELECT query, SUM(clicks) clicks FROM daily_queries
-        WHERE site_id=$1 AND date BETWEEN $2 AND $3
-        GROUP BY query ORDER BY clicks DESC LIMIT 5
-        """,
-        site_id, start, end,
+        "SELECT query, SUM(clicks) clicks FROM daily_queries "
+        "WHERE site_id=$1 AND date BETWEEN $2 AND $3 "
+        "GROUP BY query ORDER BY clicks DESC LIMIT $4",
+        site_id, start, end, top_n,
     )
     top_q_prev = await db.fetch(
-        """
-        SELECT query, SUM(clicks) clicks FROM daily_queries
-        WHERE site_id=$1 AND date BETWEEN $2 AND $3
-        GROUP BY query ORDER BY clicks DESC LIMIT 20
-        """,
+        "SELECT query, SUM(clicks) clicks FROM daily_queries "
+        "WHERE site_id=$1 AND date BETWEEN $2 AND $3 "
+        "GROUP BY query ORDER BY clicks DESC LIMIT 20",
         site_id, prev_start, prev_end,
     )
     prev_q_map = {r["query"]: int(r["clicks"] or 0) for r in top_q_prev}
 
     if top_q_cur:
-        lines += ["### Top 5 Queries", "| Query | Clicks | Δ |", "|-------|--------|---|"]
+        lines += [f"### Top {len(top_q_cur)} Queries", "| Query | Clicks | Δ |", "|-------|--------|---|"]
         for r in top_q_cur:
             cl = int(r["clicks"] or 0)
             prev_cl = prev_q_map.get(r["query"], 0)
@@ -310,44 +253,35 @@ async def _site_overview(site_id: str, prop: str, days: int) -> str:
     return "\n".join(lines)
 
 
-async def _analyze_changes(site_id: str, prop: str, days: int) -> str:
+# ─── analyze_changes ─────────────────────────────────────────────────────────
+
+async def _analyze_changes(site_id: str, prop: str, days: int, detail: str) -> str:
     start, end, prev_start, prev_end = _period_dates(days)
 
     cur_pages = await db.fetch(
-        """
-        SELECT page,
-               SUM(clicks) clicks, SUM(impressions) impressions,
-               AVG(ctr) ctr, AVG(position) position
-        FROM daily_pages WHERE site_id=$1 AND date BETWEEN $2 AND $3
-        GROUP BY page
-        """,
+        "SELECT page, SUM(clicks) clicks, SUM(impressions) impressions, "
+        "AVG(ctr) ctr, AVG(position) position "
+        "FROM daily_pages WHERE site_id=$1 AND date BETWEEN $2 AND $3 "
+        "GROUP BY page",
         site_id, start, end,
     )
     prev_pages = await db.fetch(
-        """
-        SELECT page,
-               SUM(clicks) clicks, SUM(impressions) impressions,
-               AVG(ctr) ctr, AVG(position) position
-        FROM daily_pages WHERE site_id=$1 AND date BETWEEN $2 AND $3
-        GROUP BY page
-        """,
+        "SELECT page, SUM(clicks) clicks, SUM(impressions) impressions, "
+        "AVG(ctr) ctr, AVG(position) position "
+        "FROM daily_pages WHERE site_id=$1 AND date BETWEEN $2 AND $3 "
+        "GROUP BY page",
         site_id, prev_start, prev_end,
     )
 
     if not cur_pages:
-        return (
-            f"[TOOL RESULT — NO DATA]\n"
-            f"No page-level data found in the database for property: {prop}\n"
-            f"Row count in daily_pages for this site_id and period: 0\n"
-            f"Do NOT supplement this result with example or estimated data."
-        )
+        return f"No page data for property: {prop}\nPeriod: {start} to {end}\n" + _NO_DATA
 
     cur_map = {r["page"]: r for r in cur_pages}
     prev_map = {r["page"]: r for r in prev_pages}
-
     all_pages = set(cur_map) | set(prev_map)
-    total_cur_clicks = sum(int(cur_map.get(p, {}).get("clicks", 0) or 0) for p in all_pages)
-    total_prev_clicks = sum(int(prev_map.get(p, {}).get("clicks", 0) or 0) for p in all_pages)
+
+    total_cur = sum(int(cur_map.get(p, {}).get("clicks", 0) or 0) for p in all_pages)
+    total_prev = sum(int(prev_map.get(p, {}).get("clicks", 0) or 0) for p in all_pages)
 
     drivers = []
     for page in all_pages:
@@ -358,65 +292,62 @@ async def _analyze_changes(site_id: str, prop: str, days: int) -> str:
         delta = cc - pc
         if delta == 0:
             continue
-        ci = int(c["impressions"] if c else 0 or 0)
-        pi = int(p["impressions"] if p else 0 or 0)
-        cpos = float(c["position"] if c else 0 or 0)
-        ppos = float(p["position"] if p else 0 or 0)
-        cctr = float(c["ctr"] if c else 0 or 0)
-        pctr = float(p["ctr"] if p else 0 or 0)
         drivers.append({
             "page": page, "delta": delta, "cc": cc, "pc": pc,
-            "ci": ci, "pi": pi, "cpos": cpos, "ppos": ppos,
-            "cctr": cctr, "pctr": pctr,
+            "ci": int(c["impressions"] if c else 0 or 0),
+            "pi": int(p["impressions"] if p else 0 or 0),
+            "cpos": float(c["position"] if c else 0 or 0),
+            "ppos": float(p["position"] if p else 0 or 0),
+            "cctr": float(c["ctr"] if c else 0 or 0),
+            "pctr": float(p["ctr"] if p else 0 or 0),
         })
 
     drivers.sort(key=lambda x: abs(x["delta"]), reverse=True)
-    top = drivers[:10]
+    max_items = 5 if detail == "summary" else 10
+    top = drivers[:max_items]
 
-    total_delta = total_cur_clicks - total_prev_clicks
+    total_delta = total_cur - total_prev
     lines = [
         f"## Traffic Change Analysis — {prop}",
-        f"**Period:** {start} → {end} vs {prev_start} → {prev_end}",
-        f"**Total click delta:** {_delta_str(total_cur_clicks, total_prev_clicks)} "
-        f"({_pct(total_cur_clicks, total_prev_clicks)})\n",
+        f"**Period:** {start} to {end} vs {prev_start} to {prev_end}",
+        f"*Based on daily-batch data from GSC, not real-time.*",
+        f"**Total click delta:** {_delta_str(total_cur, total_prev)} "
+        f"({_pct(total_cur, total_prev)})\n",
     ]
 
-    # Check for sudden single-day shifts
+    # Day-over-day spikes
     daily = await db.fetch(
-        """
-        SELECT date, SUM(clicks) clicks FROM daily_totals
-        WHERE site_id=$1 AND date BETWEEN $2 AND $3
-        GROUP BY date ORDER BY date
-        """,
+        "SELECT date, SUM(clicks) clicks FROM daily_totals "
+        "WHERE site_id=$1 AND date BETWEEN $2 AND $3 "
+        "GROUP BY date ORDER BY date",
         site_id, start, end,
     )
-    spike_dates = []
     prev_day_clicks = None
+    spike_dates = []
     for row in daily:
         dc = int(row["clicks"] or 0)
         if prev_day_clicks and prev_day_clicks > 0:
-            pct_change = (dc - prev_day_clicks) / prev_day_clicks
-            if abs(pct_change) > 0.15:
-                spike_dates.append((str(row["date"]), pct_change))
+            pct = (dc - prev_day_clicks) / prev_day_clicks
+            if abs(pct) > 0.15:
+                spike_dates.append((str(row["date"]), pct))
         prev_day_clicks = dc
 
     if spike_dates:
-        lines.append("### ⚡ Sudden Shifts Detected")
+        lines.append("### Sudden Shifts")
         for d, pct in spike_dates[:3]:
-            sign = "▲" if pct > 0 else "▼"
-            lines.append(f"- {d}: {sign} {abs(pct)*100:.0f}% day-over-day — possible algorithm update or external event")
+            arrow = "up" if pct > 0 else "down"
+            lines.append(f"- {d}: {abs(pct)*100:.0f}% {arrow} day-over-day — possible algorithm update or external event")
         lines.append("")
 
     if not top:
         lines.append("No significant page-level changes detected.")
         return "\n".join(lines)
 
-    lines += ["### Page Drivers (by |Δ clicks|)", ""]
+    lines += [f"### Top {len(top)} Page Drivers (by |delta clicks|)", ""]
     for d in top:
         short = d["page"].replace("https://", "").replace("http://", "")[:70]
         contribution = (abs(d["delta"]) / max(abs(total_delta), 1)) * 100
 
-        # Diagnose likely cause
         causes = []
         pos_drop = d["ppos"] > 0 and d["cpos"] > d["ppos"] + 1
         ctr_drop = d["pctr"] > 0 and d["cctr"] < d["pctr"] * 0.85
@@ -424,62 +355,61 @@ async def _analyze_changes(site_id: str, prop: str, days: int) -> str:
         ai_flag = imp_drop and ctr_drop and not pos_drop
 
         if pos_drop:
-            causes.append(f"position dropped {d['ppos']:.1f}→{d['cpos']:.1f} [confidence: high]")
+            causes.append(f"position dropped {d['ppos']:.1f} -> {d['cpos']:.1f} [high confidence]")
         if ctr_drop and not pos_drop:
-            causes.append(f"CTR fell {d['pctr']*100:.1f}%→{d['cctr']*100:.1f}% at stable position [confidence: medium]")
+            causes.append(f"CTR fell {d['pctr']*100:.1f}% -> {d['cctr']*100:.1f}% at stable position [medium confidence]")
         if imp_drop and not pos_drop:
-            causes.append(f"impressions down {d['pi']:,}→{d['ci']:,} [confidence: medium]")
+            causes.append(f"impressions down {d['pi']:,} -> {d['ci']:,} [medium confidence]")
         if ai_flag:
-            causes.append("possible AI Overview impact — CTR+impressions both fell, position stable [estimate, not fact, confidence: low]")
+            causes.append(
+                "possible AI Overview impact — CTR and impressions both fell "
+                "while position stable [estimate, NOT confirmed fact, low confidence]"
+            )
         if not causes:
-            causes.append("cause unclear — check for content/indexing changes")
+            causes.append("cause unclear — check for content or indexing changes")
 
-        arrow = "▼" if d["delta"] < 0 else "▲"
+        arrow = "DOWN" if d["delta"] < 0 else "UP"
         lines.append(
-            f"**{short}**  \n"
+            f"**{short}**\n"
             f"{arrow} {abs(d['delta']):,} clicks ({_pct(d['cc'], d['pc'])}) "
-            f"| contributes {contribution:.0f}% of total change  \n"
+            f"| {contribution:.0f}% of total change\n"
             f"Likely cause: {'; '.join(causes)}\n"
         )
 
     return "\n".join(lines)
 
 
+# ─── ai_visibility_snapshot ──────────────────────────────────────────────────
+
 async def _ai_visibility_snapshot(site_id: str, prop: str, days: int) -> str:
     start, end, prev_start, prev_end = _period_dates(days)
 
     cur_ai = await db.fetch(
-        """
-        SELECT appearance_type, SUM(clicks) clicks, SUM(impressions) impressions
-        FROM daily_ai_appearance WHERE site_id=$1 AND date BETWEEN $2 AND $3
-        GROUP BY appearance_type ORDER BY impressions DESC
-        """,
+        "SELECT appearance_type, SUM(clicks) clicks, SUM(impressions) impressions "
+        "FROM daily_ai_appearance WHERE site_id=$1 AND date BETWEEN $2 AND $3 "
+        "GROUP BY appearance_type ORDER BY impressions DESC",
         site_id, start, end,
     )
     prev_ai = await db.fetch(
-        """
-        SELECT appearance_type, SUM(clicks) clicks, SUM(impressions) impressions
-        FROM daily_ai_appearance WHERE site_id=$1 AND date BETWEEN $2 AND $3
-        GROUP BY appearance_type ORDER BY impressions DESC
-        """,
+        "SELECT appearance_type, SUM(clicks) clicks, SUM(impressions) impressions "
+        "FROM daily_ai_appearance WHERE site_id=$1 AND date BETWEEN $2 AND $3 "
+        "GROUP BY appearance_type ORDER BY impressions DESC",
         site_id, prev_start, prev_end,
     )
 
     if not cur_ai:
         return (
-            f"[TOOL RESULT — NO DATA]\n"
-            f"No AI appearance data found in the database for property: {prop}\n"
-            f"Row count in daily_ai_appearance for this site_id and period: 0\n"
-            f"Possible reasons: site has no AI Overview appearances, "
-            f"Google has not exposed this data via API for this property, "
-            f"or data collection is still in progress.\n"
-            f"Do NOT supplement this result with example or estimated data."
+            f"No AI appearance data for property: {prop}\n"
+            f"Period: {start} to {end}\n" + _NO_DATA + "\n"
+            "Possible reasons: site has no AI Overview appearances, "
+            "or Google has not exposed this data via the API for this property."
         )
 
     prev_map = {r["appearance_type"]: r for r in prev_ai}
     lines = [
         f"## AI Search Visibility — {prop}",
-        f"**Period:** {start} → {end} ({days}d)\n",
+        f"**Period:** {start} to {end} ({days}d)",
+        "*Data from GSC searchAppearance dimension. AI-specific types may be limited.*\n",
         "### Appearances by Type",
         "| Type | Impressions | Clicks | vs Prior |",
         "|------|-------------|--------|----------|",
@@ -494,96 +424,72 @@ async def _ai_visibility_snapshot(site_id: str, prop: str, days: int) -> str:
         lines.append(f"| {at} | {ci:,} | {cc:,} | {_pct(ci, pi)} |")
 
     lines.append("")
-
-    # Pages where AI impressions grew but CTR fell — requires cross-referencing
-    # daily_pages (overall) vs daily_ai_appearance (site-level only, no page breakdown)
-    # TODO: When GSC API exposes page-level AI appearance data, implement per-page analysis.
-    # Currently, searchAppearance dimension only returns site-level totals.
     ai_types = {r["appearance_type"] for r in cur_ai}
     ai_related = [t for t in ai_types if any(k in t.upper() for k in ["AI", "OVERVIEW", "SGE"])]
     if ai_related:
         lines += [
-            "### Observation",
+            "### Note",
             f"AI-related appearance types detected: {', '.join(ai_related)}",
-            "",
-            "*(Page-level AI appearance breakdown is not yet available via the GSC API. "
-            "Cross-referencing with CTR data is estimated at site level only.)*",
+            "Page-level AI appearance breakdown is not available via the GSC API. "
+            "Cross-referencing with CTR data is estimated at site level only.",
         ]
 
     return "\n".join(lines)
 
+
+# ─── low_hanging_fruit ───────────────────────────────────────────────────────
 
 async def _low_hanging_fruit(site_id: str, prop: str, min_impressions: int) -> str:
     end = date.today() - timedelta(days=2)
     start = end - timedelta(days=27)
 
     rows = await db.fetch(
-        """
-        SELECT q.query, p.page,
-               AVG(q.position) avg_pos,
-               SUM(q.impressions) impressions,
-               AVG(q.ctr) avg_ctr
-        FROM daily_queries q
-        JOIN daily_pages p ON p.site_id = q.site_id AND p.date = q.date
-        WHERE q.site_id = $1
-          AND q.date BETWEEN $2 AND $3
-          AND q.position BETWEEN 8 AND 15
-        GROUP BY q.query, p.page
-        HAVING SUM(q.impressions) >= $4
-        ORDER BY SUM(q.impressions) DESC
-        LIMIT 50
-        """,
+        "SELECT q.query, p.page, AVG(q.position) avg_pos, "
+        "SUM(q.impressions) impressions, AVG(q.ctr) avg_ctr "
+        "FROM daily_queries q "
+        "JOIN daily_pages p ON p.site_id = q.site_id AND p.date = q.date "
+        "WHERE q.site_id = $1 AND q.date BETWEEN $2 AND $3 "
+        "AND q.position BETWEEN 8 AND 15 "
+        "GROUP BY q.query, p.page "
+        "HAVING SUM(q.impressions) >= $4 "
+        "ORDER BY SUM(q.impressions) DESC LIMIT 50",
         site_id, start, end, min_impressions,
     )
 
-    # Fallback: queries only (without page join) if above returns empty
     if not rows:
         rows = await db.fetch(
-            """
-            SELECT query, NULL::text AS page,
-                   AVG(position) avg_pos,
-                   SUM(impressions) impressions,
-                   AVG(ctr) avg_ctr
-            FROM daily_queries
-            WHERE site_id=$1 AND date BETWEEN $2 AND $3
-              AND position BETWEEN 8 AND 15
-            GROUP BY query
-            HAVING SUM(impressions) >= $4
-            ORDER BY impressions DESC
-            LIMIT 50
-            """,
+            "SELECT query, NULL::text AS page, AVG(position) avg_pos, "
+            "SUM(impressions) impressions, AVG(ctr) avg_ctr "
+            "FROM daily_queries "
+            "WHERE site_id=$1 AND date BETWEEN $2 AND $3 "
+            "AND position BETWEEN 8 AND 15 "
+            "GROUP BY query "
+            "HAVING SUM(impressions) >= $4 "
+            "ORDER BY impressions DESC LIMIT 50",
             site_id, start, end, min_impressions,
         )
 
     if not rows:
         return (
-            f"[TOOL RESULT — NO DATA]\n"
-            f"No queries found in database for property: {prop}\n"
-            f"Filter: position 8–15, impressions >= {min_impressions}, last 28 days\n"
-            f"Row count: 0\n"
-            f"Do NOT supplement this result with example or estimated data."
+            f"No queries found for property: {prop}\n"
+            f"Filter: position 8-15, impressions >= {min_impressions}, last 28 days\n"
+            + _NO_DATA
         )
 
-    # Estimate upside: rough CTR model top-5 avg = 15%, top-1 = 28%
     TOP5_CTR = 0.15
 
-    def est_upside(impressions: int, current_ctr: float) -> int:
-        uplift = max(TOP5_CTR - current_ctr, 0)
-        return int(impressions * uplift)
+    def est_upside(imp: int, ctr: float) -> int:
+        return int(imp * max(TOP5_CTR - ctr, 0))
 
     results = []
     for r in rows:
         pos = float(r["avg_pos"])
         imp = int(r["impressions"])
         ctr = float(r["avg_ctr"])
-        upside = est_upside(imp, ctr)
         results.append({
-            "query": r["query"],
-            "page": r["page"],
-            "pos": pos,
-            "imp": imp,
-            "ctr": ctr,
-            "upside": upside,
+            "query": r["query"], "page": r["page"],
+            "pos": pos, "imp": imp, "ctr": ctr,
+            "upside": est_upside(imp, ctr),
         })
 
     results.sort(key=lambda x: x["upside"], reverse=True)
@@ -591,25 +497,19 @@ async def _low_hanging_fruit(site_id: str, prop: str, min_impressions: int) -> s
 
     lines = [
         f"## Low-Hanging Fruit — {prop}",
-        f"**Queries ranked 8–15, ≥{min_impressions} impressions (last 28 days)**\n",
+        f"**Queries ranked 8-15, >={min_impressions} impressions (last 28 days)**",
+        "*Upside estimate assumes reaching avg top-5 CTR of ~15%. Actual results vary.*\n",
         "| Query | Position | Impressions | Est. extra clicks/mo |",
         "|-------|----------|-------------|----------------------|",
     ]
-
     for r in top10:
-        lines.append(
-            f"| {r['query'][:55]} | {r['pos']:.1f} | {r['imp']:,} | +{r['upside']:,} |"
-        )
+        lines.append(f"| {r['query'][:55]} | {r['pos']:.1f} | {r['imp']:,} | +{r['upside']:,} |")
 
     lines += [
         "",
         "### Optimization hints",
-        "- **Position 8–10:** Update title tag and intro paragraph to better match query intent. "
-        "Add an FAQ section targeting the query phrasing.",
-        "- **Position 11–15:** Content likely needs to be more comprehensive. "
-        "Expand coverage, add examples, and improve internal linking to the page.",
-        "",
-        "*(Upside estimate assumes reaching avg top-5 CTR of ~15%. Actual results vary.)*",
+        "- **Position 8-10:** Update title tag and intro to better match query intent. Add an FAQ section.",
+        "- **Position 11-15:** Content likely needs more depth. Expand coverage and improve internal linking.",
     ]
 
     return "\n".join(lines)
