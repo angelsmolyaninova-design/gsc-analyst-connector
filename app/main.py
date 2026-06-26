@@ -265,7 +265,7 @@ routes = [
 middleware = [
     Middleware(
         SessionMiddleware,
-        secret_key=os.environ.get("SESSION_SECRET_KEY", "dev-secret-change-me"),
+        secret_key=os.environ["SESSION_SECRET_KEY"],
         https_only=os.environ.get("BASE_URL", "").startswith("https"),
     )
 ]
