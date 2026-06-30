@@ -192,10 +192,13 @@ async def daily_collect_all() -> None:
             service = build_service(user["google_refresh_token"])
         except Exception as e:
             log.error(
-                "daily_collect token_refresh_failed user_id=%s error=%s",
-                user["id"], e,
+                "user_deactivated_token_failure user_id=%s email=%s error=%s "
+                "reason=refresh_token_invalid_or_revoked action_needed=user_must_reconnect",
+                user["id"], user["email"], e,
             )
-            # Mark inactive to avoid repeated failures on bad tokens
+            # Mark inactive to avoid repeated failures on bad tokens.
+            # The MCP connector will surface a reconnect message on next tool call
+            # (see main.py RECONNECT_MESSAGE) instead of silently returning stale data.
             await db.execute(
                 "UPDATE users SET is_active = false WHERE id = $1", user["id"]
             )

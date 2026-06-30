@@ -66,7 +66,18 @@ PERIOD_PARAM = {
 }
 
 
-def _build_user_server(user_id: str):
+RECONNECT_MESSAGE = (
+    "[TOOL RESULT — ACCOUNT NEEDS RECONNECTION]\n"
+    "Your Google connection has expired or was revoked, so data collection has "
+    "stopped. This is not a data result — do NOT supplement it with example or "
+    "estimated data.\n\n"
+    "Tell the user clearly: their GSC Analyst connection needs to be renewed. "
+    "They should visit the connect page again to reconnect their Google account: "
+    f"{os.environ.get('BASE_URL', '')}/connect"
+)
+
+
+def _build_user_server(user_id: str, is_active: bool = True):
     from mcp.server import Server
     from mcp.types import Tool, TextContent
 
@@ -218,6 +229,8 @@ def _build_user_server(user_id: str):
 
     @server.call_tool()
     async def call_tool(name: str, arguments: dict) -> list[TextContent]:
+        if not is_active and name != "ping":
+            return [TextContent(type="text", text=RECONNECT_MESSAGE)]
         return await dispatch_tool(name, arguments, user_id=user_id)
 
     return server
@@ -235,9 +248,13 @@ async def sse_endpoint(request: Request):
         return Response("Connector not found. Check your connector URL.", status_code=404)
 
     user_id = str(user["id"])
-    log.info("mcp_sse_connect user_id=%s", user_id)
+    is_active = user["is_active"]
+    if not is_active:
+        log.warning("mcp_sse_connect_inactive_user user_id=%s", user_id)
+    else:
+        log.info("mcp_sse_connect user_id=%s", user_id)
 
-    mcp_server = _build_user_server(user_id)
+    mcp_server = _build_user_server(user_id, is_active=is_active)
     async with sse_transport.connect_sse(
         request.scope, request.receive, request._send
     ) as streams:

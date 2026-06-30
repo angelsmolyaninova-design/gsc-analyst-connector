@@ -44,7 +44,7 @@ async def execute(query: str, *args):
 
 async def get_user_by_token(user_token: str) -> asyncpg.Record | None:
     return await fetchrow(
-        "SELECT * FROM users WHERE user_token = $1 AND is_active = true",
+        "SELECT * FROM users WHERE user_token = $1",
         user_token,
     )
 
