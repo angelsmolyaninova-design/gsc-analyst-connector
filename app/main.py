@@ -161,6 +161,35 @@ def _build_user_server(user_id: str):
                 },
             ),
             Tool(
+                name="page_quick_audit",
+                description=(
+                    "Fetches a single page and extracts lightweight content signals: "
+                    "title, H1, H2s (up to 10), meta description, approximate word count, "
+                    "presence of JSON-LD structured data, and whether the page has a "
+                    "noindex directive. Cross-references the URL with 28 days of GSC data "
+                    "(clicks, impressions, position) if available. "
+                    "Fetch may fail with 403 if the server blocks automated requests — "
+                    "that is reported cleanly. No crawling, no LLM calls, no storage. "
+                    "Use when the user asks about a specific page's content or structure."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "url": {
+                            "type": "string",
+                            "description": "Full URL of the page to audit (must start with http:// or https://).",
+                        },
+                        "site": SITE_PARAM,
+                    },
+                    "required": ["url"],
+                },
+                annotations={
+                    "title": "Quick page audit",
+                    "readOnlyHint": True,
+                    "destructiveHint": False,
+                },
+            ),
+            Tool(
                 name="low_hanging_fruit",
                 description=(
                     "Finds queries ranked in positions 8-15 with enough impressions to be "

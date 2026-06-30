@@ -1,8 +1,10 @@
 """MCP tool definitions for GSC Analyst."""
 import logging
+import re
 import time
 from datetime import date, timedelta
 
+import httpx
 from mcp.types import TextContent
 
 from app import db
@@ -114,6 +116,9 @@ async def _dispatch(
     elif name == "low_hanging_fruit":
         min_imp = args.get("min_impressions", 200)
         r = await _low_hanging_fruit(site_id, property_name, min_imp)
+    elif name == "page_quick_audit":
+        url = args.get("url", "")
+        r = await _page_quick_audit(url, site_id)
     else:
         r = f"Unknown tool: {name}"
 
@@ -511,5 +516,146 @@ async def _low_hanging_fruit(site_id: str, prop: str, min_impressions: int) -> s
         "- **Position 8-10:** Update title tag and intro to better match query intent. Add an FAQ section.",
         "- **Position 11-15:** Content likely needs more depth. Expand coverage and improve internal linking.",
     ]
+
+    return "\n".join(lines)
+
+
+# ─── page_quick_audit ────────────────────────────────────────────────────────
+
+def _extract_text(html: str) -> str:
+    """Strip tags, collapse whitespace — rough visible text."""
+    text = re.sub(r"<(script|style)[^>]*>.*?</\1>", " ", html, flags=re.S | re.I)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"&[a-z]+;", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _first(pattern: str, html: str, flags: int = re.S | re.I) -> str | None:
+    m = re.search(pattern, html, flags)
+    return m.group(1).strip() if m else None
+
+
+async def _page_quick_audit(url: str, site_id: str) -> str:
+    if not url:
+        return "Error: 'url' parameter is required."
+    if not url.startswith(("http://", "https://")):
+        return "Error: 'url' must start with http:// or https://"
+
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (compatible; GSCAnalystBot/1.0; "
+            "+https://gsc-analyst.app/bot)"
+        ),
+        "Accept": "text/html,application/xhtml+xml",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+
+    try:
+        async with httpx.AsyncClient(
+            follow_redirects=True, timeout=10.0
+        ) as client:
+            resp = await client.get(url, headers=headers)
+    except httpx.TimeoutException:
+        return f"Fetch timed out after 10s for: {url}\nSome servers block automated requests."
+    except httpx.RequestError as e:
+        return f"Could not reach {url}: {type(e).__name__}."
+
+    if resp.status_code == 403:
+        return f"Access denied (403) for: {url}\nThis server blocks automated fetches."
+    if resp.status_code == 404:
+        return f"Page not found (404): {url}"
+    if resp.status_code != 200:
+        return f"Unexpected response {resp.status_code} from: {url}"
+
+    html = resp.text
+
+    # ── Extract elements ──────────────────────────────────────────────────
+    title = _first(r"<title[^>]*>(.*?)</title>", html) or "(no title)"
+
+    h1 = _first(r"<h1[^>]*>(.*?)</h1>", html)
+    if h1:
+        h1 = re.sub(r"<[^>]+>", "", h1).strip()
+
+    h2_matches = re.findall(r"<h2[^>]*>(.*?)</h2>", html, re.S | re.I)
+    h2s = [re.sub(r"<[^>]+>", "", h).strip() for h in h2_matches[:10]]
+
+    meta_desc = _first(
+        r'<meta[^>]+name=["\']description["\'][^>]+content=["\']([^"\']+)["\']', html
+    ) or _first(
+        r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+name=["\']description["\']', html
+    )
+
+    visible_text = _extract_text(html)
+    word_count = len(visible_text.split())
+
+    # Structured data
+    has_schema = bool(re.search(
+        r'<script[^>]+type=["\']application/ld\+json["\']', html, re.I
+    ))
+    schema_type = None
+    if has_schema:
+        schema_type = _first(r'"@type"\s*:\s*"([^"]+)"', html)
+
+    # Robots noindex
+    is_noindex = bool(re.search(
+        r'<meta[^>]+name=["\']robots["\'][^>]+content=[^>]*noindex', html, re.I
+    ) or re.search(
+        r'<meta[^>]+content=[^>]*noindex[^>]+name=["\']robots["\']', html, re.I
+    ))
+
+    # ── GSC cross-reference ───────────────────────────────────────────────
+    gsc_row = None
+    if site_id:
+        end = date.today() - timedelta(days=2)
+        start = end - timedelta(days=27)
+        # Try exact URL match; also try with/without trailing slash
+        alt_url = url.rstrip("/") if url.endswith("/") else url + "/"
+        gsc_row = await db.fetchrow(
+            "SELECT SUM(clicks) clicks, SUM(impressions) impressions, "
+            "AVG(position) position "
+            "FROM daily_pages "
+            "WHERE site_id=$1 AND date BETWEEN $2 AND $3 "
+            "AND page IN ($4, $5)",
+            site_id, start, end, url, alt_url,
+        )
+
+    # ── Format output ─────────────────────────────────────────────────────
+    lines = [
+        f"## Page Audit — {url}",
+        "",
+        f"**Title:** {title}",
+        f"**H1:** {h1 or '(none found)'}",
+    ]
+
+    if h2s:
+        lines.append(f"**H2s ({len(h2s)}):** " + " / ".join(
+            f'"{h[:60]}"' for h in h2s
+        ))
+    else:
+        lines.append("**H2s:** (none found)")
+
+    lines += [
+        f"**Meta description:** {meta_desc[:160] if meta_desc else '(missing)'}",
+        f"**Word count (approx):** {word_count:,}",
+        f"**Structured data:** {'Yes — type: ' + schema_type if has_schema and schema_type else ('Yes (type unknown)' if has_schema else 'No')}",
+        f"**Noindex:** {'Yes — page is blocked from search indexing' if is_noindex else 'No'}",
+    ]
+
+    # GSC metrics
+    if gsc_row and gsc_row["clicks"] is not None:
+        lines += [
+            "",
+            "### GSC Metrics (last 28 days)",
+            f"Clicks: {int(gsc_row['clicks']):,} | "
+            f"Impressions: {int(gsc_row['impressions']):,} | "
+            f"Avg position: {float(gsc_row['position']):.1f}",
+        ]
+    else:
+        lines += [
+            "",
+            "### GSC Metrics",
+            "No data found for this URL in the last 28 days "
+            "(page may not have received clicks, or URL doesn't match exactly).",
+        ]
 
     return "\n".join(lines)
